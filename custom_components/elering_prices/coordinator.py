@@ -13,6 +13,7 @@ ELERING_URL = "https://dashboard.elering.ee/api/nps/price"
 
 
 def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
+    """Return the [start,end) window whose boundary is 22:00 UTC."""
     today_22 = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
     if now_utc < today_22:
         start = today_22 - timedelta(days=1)
@@ -24,8 +25,11 @@ def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
 
 
 class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
+    """Fetches full-day (22Z→22Z) quarter prices once per window, with VAT applied."""
+
     def __init__(self, hass: HomeAssistant, country: str, vat_percent: float) -> None:
-        super().__init__(hass, _LOGGER, name="elering_nordpool", update_interval=timedelta(minutes=15))
+        # Tick every minute so updates are aligned to real time, not install time.
+        super().__init__(hass, _LOGGER, name="elering_nordpool", update_interval=timedelta(minutes=1))
         self._country = country.lower()
         self._vat_factor = 1.0 + (vat_percent / 100.0)
         self._cache: Dict[str, Any] = {}
@@ -43,17 +47,22 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
     # ---------------------------------
 
     async def _async_update_data(self) -> Dict[str, Any]:
+        """
+        Called minutely. We only hit the API when the 22:00Z window flips.
+        Otherwise we just serve the cached day, which already contains all quarters.
+        """
         now_utc = datetime.now(timezone.utc)
         start, end = _day_bounds_22utc(now_utc)
         win = (int(start.timestamp()), int(end.timestamp()))
 
+        # If we already fetched for this 22Z→22Z window, just return the cache.
         if self._cache and self._cache_window == win:
             return self._cache
 
         params = {
             "start": start.isoformat().replace("+00:00", "Z"),
             "end": end.isoformat().replace("+00:00", "Z"),
-            "fields": self._country,  # request the country column explicitly
+            "fields": self._country,  # request the country column explicitly when available
         }
 
         session = async_get_clientsession(self.hass)
@@ -72,6 +81,10 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
                     _LOGGER.error("Elering non-JSON response preview: %s", text[:300])
                     raise UpdateFailed(f"Elering JSON parse failed: {je}") from je
         except Exception as e:
+            # If we already have a cache, keep serving it and surface the error to the log.
+            if self._cache:
+                _LOGGER.error("Elering fetch failed (serving cached data): %s", e)
+                return self._cache
             raise UpdateFailed(f"Elering fetch failed: {e}") from e
 
         rows = None
@@ -84,7 +97,7 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         if rows is None and isinstance(payload, list):
             rows = payload
 
-        # Variant C: {"data": {"series": [ {...}, ... ]}} or similar
+        # Variant C: {"data": {"series"/"records"/"rows"/<country>: [ {...}, ... ]}}
         if rows is None and isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             d = payload["data"]
             for key in ("series", "records", "rows", self._country):
@@ -95,15 +108,17 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         if rows is None:
             prev = str(payload)
             _LOGGER.error("Unexpected Elering payload (preview): %s", prev[:400])
+            # Serve stale cache if present to avoid blanks
+            if self._cache:
+                return self._cache
             raise UpdateFailed("Elering JSON missing price rows")
 
         quarters: List[Dict[str, Any]] = []
         for row in rows:
-            # Timestamp normalization
+            # --- Timestamp normalization ---
             ts_raw = row.get("timestamp") if isinstance(row, dict) else None
             if ts_raw is None and isinstance(row, dict):
-                # some shapes use "ts"
-                ts_raw = row.get("ts")
+                ts_raw = row.get("ts")  # some shapes use 'ts'
 
             ts: int | None = None
             if isinstance(ts_raw, (int, float)):
@@ -119,13 +134,12 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             if ts is None:
                 continue
 
-            # Price can be in country column or generic "price"
+            # --- Price detection (country column or generic 'price') ---
             price_raw = None
             if isinstance(row, dict):
                 price_raw = row.get(self._country)
                 if price_raw is None:
                     price_raw = row.get("price")
-
             if price_raw is None:
                 continue
 
@@ -134,12 +148,13 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             except Exception:
                 continue
 
+            # Apply VAT once, cache full-day quarters
             price_vat = round(price * self._vat_factor, 5)
             quarters.append({"ts": ts, "price": price_vat})
 
         quarters.sort(key=lambda x: x["ts"])
 
-        # Build hourly averages (mean of available quarters in that hour)
+        # Hourly averages as mean of available quarters within the hour
         hours: List[Dict[str, Any]] = []
         if quarters:
             cur_hour = None
