@@ -1,0 +1,12 @@
+{
+  "domain": "elering_nordpool",
+  "name": "Elering Nordpool Prices",
+  "version": "0.1.0",
+  "documentation": "https://github.com/<youruser>/homeassistant-elering-nordpool",
+  "issue_tracker": "https://github.com/<youruser>/homeassistant-elering-nordpool/issues",
+  "requirements": [],
+  "codeowners": ["@koithalman"],
+  "iot_class": "cloud_polling",
+  "config_flow": true,
+  "loggers": ["custom_components.elering_nordpool"]
+}

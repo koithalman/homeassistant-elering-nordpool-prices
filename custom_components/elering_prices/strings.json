@@ -1,0 +1,19 @@
+{
+  "title": "Elering Nordpool Prices",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Elering Nordpool Prices",
+        "description": "Choose country and VAT %",
+        "data": {
+          "country": "Country (ee, fi, lv, lt)",
+          "vat_percent": "VAT percent"
+        }
+      }
+    },
+    "error": {
+      "invalid_country": "Unsupported country",
+      "invalid_vat": "VAT must be 0-100"
+    }
+  }
+}

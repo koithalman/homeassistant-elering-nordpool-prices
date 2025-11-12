@@ -1,0 +1,7 @@
+{
+  "name": "Elering Nordpool Prices",
+  "render_readme": true,
+  "domains": ["elering_nordpool"],
+  "country": "EE",
+  "homeassistant": "2024.6.0"
+}
