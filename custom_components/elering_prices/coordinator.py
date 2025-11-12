@@ -1,18 +1,27 @@
 from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
-import logging
-import aiohttp
 
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+import aiohttp
+import async_timeout
+
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.util import dt as dt_util
+import logging
 
 _LOGGER = logging.getLogger(__name__)
+
 ELERING_URL = "https://dashboard.elering.ee/api/nps/price"
 
 
-def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
+def _day_bounds_22utc(now_utc: datetime) -> tuple[datetime, datetime]:
+    """Return [start, end) bounds that run from 22:00Z to 22:00Z."""
     today_22 = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
     if now_utc < today_22:
         start = today_22 - timedelta(days=1)
@@ -23,154 +32,157 @@ def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
     return start, end
 
 
+@dataclass
+class PricePoint:
+    ts: int
+    price: float  # €/MWh VAT-included
+
+
 class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
+    """Coordinator fetching 15-min Elering prices, VAT-applied, plus hourly averages."""
+
     def __init__(self, hass: HomeAssistant, country: str, vat_percent: float) -> None:
-        super().__init__(hass, _LOGGER, name="elering_nordpool", update_interval=timedelta(minutes=15))
-        self._country = country.lower()
+        # No periodic timer; we run on exact wall clock via scheduler.
+        super().__init__(hass, _LOGGER, name="elering_prices", update_interval=None)
+        self._country = country.lower().strip()
         self._vat_factor = 1.0 + (vat_percent / 100.0)
         self._cache: Dict[str, Any] = {}
         self._cache_window: Tuple[int, int] | None = None
+        self._unsub_timer = None  # scheduler unsub
 
-    # ---- helpers used by sensors ----
+    # ----------------------
+    # Public helpers for sensors
+    # ----------------------
     def now_ts(self) -> int:
-        return int(datetime.now(timezone.utc).timestamp())
+        """UTC 'now' as epoch seconds."""
+        return int(dt_util.utcnow().timestamp())
 
-    def quarters(self) -> List[Dict[str, Any]]:
-        return self.data.get("quarters", []) if self.data else []
+    # ----------------------
+    # Clock-aligned scheduler
+    # ----------------------
+    def start_scheduler(self) -> None:
+        """Refresh exactly at 00/15/30/45 each hour (second 0)."""
+        if self._unsub_timer:
+            return
 
-    def hours(self) -> List[Dict[str, Any]]:
-        return self.data.get("hours", []) if self.data else []
-    # ---------------------------------
+        # If you only care about hourly rollovers, set minute=[0].
+        self._unsub_timer = async_track_time_change(
+            self.hass,
+            self._on_tick,
+            second=0,
+            minute=[0, 15, 30, 45],
+        )
+        _LOGGER.debug("Elering scheduler started (aligned to 00/15/30/45).")
 
+    def stop_scheduler(self) -> None:
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+            _LOGGER.debug("Elering scheduler stopped.")
+
+    @callback
+    async def _on_tick(self, _now) -> None:
+        """Kick the coordinator right on time."""
+        _LOGGER.debug("Elering scheduler tick → async_request_refresh()")
+        await self.async_request_refresh()
+
+    # ----------------------
+    # Core fetch
+    # ----------------------
     async def _async_update_data(self) -> Dict[str, Any]:
-        now_utc = datetime.now(timezone.utc)
+        """Fetch (or reuse cached) 22:00Z→22:00Z window and compute outputs."""
+        now_utc = dt_util.utcnow()
         start, end = _day_bounds_22utc(now_utc)
         win = (int(start.timestamp()), int(end.timestamp()))
 
+        # Use cached day if already fetched and still valid
         if self._cache and self._cache_window == win:
             return self._cache
 
         params = {
-            "start": start.isoformat().replace("+00:00", "Z"),
-            "end": end.isoformat().replace("+00:00", "Z"),
-            "fields": self._country,  # request the country column explicitly
+            "start": start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "end": end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
         session = async_get_clientsession(self.hass)
         try:
-            async with session.get(
-                ELERING_URL,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=20),
-            ) as resp:
-                text = await resp.text()
-                if resp.status != 200:
-                    raise UpdateFailed(f"Elering HTTP {resp.status}: {text[:200]}")
-                try:
-                    payload = await resp.json(content_type=None)
-                except Exception as je:
-                    _LOGGER.error("Elering non-JSON response preview: %s", text[:300])
-                    raise UpdateFailed(f"Elering JSON parse failed: {je}") from je
+            async with async_timeout.timeout(30):
+                async with session.get(ELERING_URL, params=params) as resp:
+                    if resp.status != 200:
+                        raise UpdateFailed(f"Elering HTTP {resp.status}")
+                    # Sometimes content-type is odd; don't force it.
+                    data = await resp.json(content_type=None)
         except Exception as e:
             raise UpdateFailed(f"Elering fetch failed: {e}") from e
 
-        rows = None
+        # API can be: {"data": [...]} or directly [...]
+        if isinstance(data, dict):
+            rows = data.get("data")
+        else:
+            rows = data
 
-        # Variant A: {"data": [ {...}, ... ]}
-        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
-            rows = payload["data"]
+        if not isinstance(rows, list):
+            raise UpdateFailed("Elering JSON missing 'data' list")
 
-        # Variant B: top-level list: [ {...}, ... ]
-        if rows is None and isinstance(payload, list):
-            rows = payload
+        quarters: list[PricePoint] = []
 
-        # Variant C: {"data": {"series": [ {...}, ... ]}} or similar
-        if rows is None and isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-            d = payload["data"]
-            for key in ("series", "records", "rows", self._country):
-                if isinstance(d.get(key), list):
-                    rows = d[key]
-                    break
-
-        if rows is None:
-            prev = str(payload)
-            _LOGGER.error("Unexpected Elering payload (preview): %s", prev[:400])
-            raise UpdateFailed("Elering JSON missing price rows")
-
-        quarters: List[Dict[str, Any]] = []
         for row in rows:
-            # Timestamp normalization
-            ts_raw = row.get("timestamp") if isinstance(row, dict) else None
-            if ts_raw is None and isinstance(row, dict):
-                # some shapes use "ts"
-                ts_raw = row.get("ts")
-
-            ts: int | None = None
-            if isinstance(ts_raw, (int, float)):
-                ts = int(ts_raw)
-            elif isinstance(ts_raw, str):
-                if ts_raw.isdigit():
-                    ts = int(ts_raw)
-                else:
-                    try:
-                        ts = int(datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp())
-                    except Exception:
-                        ts = None
+            # Timestamp
+            ts = row.get("timestamp") or row.get("ts")
             if ts is None:
                 continue
+            if isinstance(ts, str):
+                if ts.isdigit():
+                    ts = int(ts)
+                else:
+                    try:
+                        ts = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+                    except Exception:
+                        continue
+            elif not isinstance(ts, int):
+                try:
+                    ts = int(ts)
+                except Exception:
+                    continue
 
-            # Price can be in country column or generic "price"
-            price_raw = None
-            if isinstance(row, dict):
-                price_raw = row.get(self._country)
-                if price_raw is None:
-                    price_raw = row.get("price")
-
-            if price_raw is None:
+            # Price — prefer country key, fallback to generic "price"
+            raw = row.get(self._country)
+            if raw is None:
+                raw = row.get("price")
+            if raw is None:
                 continue
 
             try:
-                price = float(price_raw)
+                price = float(raw)  # €/MWh ex-VAT from API
             except Exception:
                 continue
 
-            price_vat = round(price * self._vat_factor, 5)
-            quarters.append({"ts": ts, "price": price_vat})
+            price_vat = round(price * self._vat_factor, 5)  # €/MWh VAT-in
+            quarters.append(PricePoint(ts=ts, price=price_vat))
 
-        quarters.sort(key=lambda x: x["ts"])
+        quarters.sort(key=lambda p: p.ts)
 
-        # Build hourly averages (mean of available quarters in that hour)
-        hours: List[Dict[str, Any]] = []
-        if quarters:
-            cur_hour = None
-            bucket: List[float] = []
-            for q in quarters:
-                hts = (q["ts"] // 3600) * 3600
-                if cur_hour is None:
-                    cur_hour = hts
-                if hts != cur_hour:
-                    if bucket:
-                        hours.append({"ts": cur_hour, "price": sum(bucket) / len(bucket)})
-                    cur_hour = hts
-                    bucket = []
-                bucket.append(q["price"])
-            if bucket:
-                hours.append({"ts": cur_hour, "price": sum(bucket) / len(bucket)})
+        # Build hourly averages from quarter points (group by hour)
+        hourly_buckets: dict[int, list[float]] = defaultdict(list)
+        for q in quarters:
+            hour_ts = (q.ts // 3600) * 3600
+            hourly_buckets[hour_ts].append(q.price)
 
-        result: Dict[str, Any] = {
-            "as_of": datetime.now(timezone.utc).isoformat(),
+        hours: list[dict[str, Any]] = []
+        for hts in sorted(hourly_buckets.keys()):
+            bucket = hourly_buckets[hts]
+            hours.append({"ts": hts, "price": sum(bucket) / len(bucket)})
+
+        payload: Dict[str, Any] = {
+            "as_of": dt_util.utcnow().isoformat(),
             "country": self._country,
+            "vat_percent": round((self._vat_factor - 1.0) * 100.0, 3),
             "start_utc": params["start"],
             "end_utc": params["end"],
-            "quarters": quarters,
+            "quarters": [{"ts": p.ts, "price": p.price} for p in quarters],
             "hours": hours,
         }
 
-        self._cache = result
+        self._cache = payload
         self._cache_window = win
-
-        _LOGGER.debug(
-            "Fetched %d quarters, %d hours for %s (VAT factor %.3f)",
-            len(quarters), len(hours), self._country, self._vat_factor
-        )
-        return result
+        return payload
