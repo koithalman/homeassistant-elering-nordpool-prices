@@ -4,17 +4,15 @@ from typing import Any, Dict, List, Tuple
 import logging
 import aiohttp
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.helpers.event import async_track_time_change
 
 _LOGGER = logging.getLogger(__name__)
 ELERING_URL = "https://dashboard.elering.ee/api/nps/price"
 
 
 def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
-    """Return [start, end) bounds from 22:00Z to 22:00Z."""
     today_22 = now_utc.replace(hour=22, minute=0, second=0, microsecond=0)
     if now_utc < today_22:
         start = today_22 - timedelta(days=1)
@@ -26,16 +24,12 @@ def _day_bounds_22utc(now_utc: datetime) -> Tuple[datetime, datetime]:
 
 
 class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
-    """Fetches Elering quarter-hour prices and hourly means, aligned to wall-clock."""
-
     def __init__(self, hass: HomeAssistant, country: str, vat_percent: float) -> None:
-        # No drifting interval — we'll trigger on exact :00/:15/:30/:45 via scheduler.
-        super().__init__(hass, _LOGGER, name="elering_nordpool", update_interval=None)
+        super().__init__(hass, _LOGGER, name="elering_nordpool", update_interval=timedelta(minutes=15))
         self._country = country.lower()
         self._vat_factor = 1.0 + (vat_percent / 100.0)
         self._cache: Dict[str, Any] = {}
         self._cache_window: Tuple[int, int] | None = None
-        self._unsub_timer = None  # scheduler unsubscribe handle
 
     # ---- helpers used by sensors ----
     def now_ts(self) -> int:
@@ -48,43 +42,11 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         return self.data.get("hours", []) if self.data else []
     # ---------------------------------
 
-    # ----------------------
-    # Wall-clock scheduler
-    # ----------------------
-    def start_scheduler(self) -> None:
-        """Refresh at exact 00/15/30/45 each hour (local time), at second 0."""
-        if self._unsub_timer:
-            return
-        self._unsub_timer = async_track_time_change(
-            self.hass,
-            self._on_tick,
-            second=0,
-            minute=[0, 15, 30, 45],
-        )
-        _LOGGER.debug("Elering scheduler started (aligned to :00/:15/:30/:45).")
-
-    def stop_scheduler(self) -> None:
-        """Stop the wall-clock scheduler."""
-        if self._unsub_timer:
-            self._unsub_timer()
-            self._unsub_timer = None
-            _LOGGER.debug("Elering scheduler stopped.")
-
-    @callback
-    async def _on_tick(self, _now) -> None:
-        """Kick the coordinator exactly on schedule."""
-        _LOGGER.debug("Quarter-hour tick → async_request_refresh()")
-        await self.async_request_refresh()
-
-    # ----------------------
-    # Core fetch
-    # ----------------------
     async def _async_update_data(self) -> Dict[str, Any]:
         now_utc = datetime.now(timezone.utc)
         start, end = _day_bounds_22utc(now_utc)
         win = (int(start.timestamp()), int(end.timestamp()))
 
-        # Use cached day if already fetched for this 22Z-22Z window
         if self._cache and self._cache_window == win:
             return self._cache
 
@@ -122,7 +84,7 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
         if rows is None and isinstance(payload, list):
             rows = payload
 
-        # Variant C: {"data": {"series"/"records"/"rows"/<country>: [ {...}, ... ]}}
+        # Variant C: {"data": {"series": [ {...}, ... ]}} or similar
         if rows is None and isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             d = payload["data"]
             for key in ("series", "records", "rows", self._country):
@@ -140,7 +102,8 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             # Timestamp normalization
             ts_raw = row.get("timestamp") if isinstance(row, dict) else None
             if ts_raw is None and isinstance(row, dict):
-                ts_raw = row.get("ts")  # some shapes use "ts"
+                # some shapes use "ts"
+                ts_raw = row.get("ts")
 
             ts: int | None = None
             if isinstance(ts_raw, (int, float)):
@@ -156,12 +119,13 @@ class EleringCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
             if ts is None:
                 continue
 
-            # Price in country column or generic "price"
+            # Price can be in country column or generic "price"
             price_raw = None
             if isinstance(row, dict):
                 price_raw = row.get(self._country)
                 if price_raw is None:
                     price_raw = row.get("price")
+
             if price_raw is None:
                 continue
 
